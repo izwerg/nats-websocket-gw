@@ -234,9 +234,9 @@ func (gw *Gateway) wsToNatsWorker(nats net.Conn, ws *websocket.Conn, doneCh chan
 		doneCh <- true
 	}()
 	var buf []byte
-	if gw.settings.Trace {
-		buf = make([]byte, 1024*1024)
-	}
+	//if gw.settings.Trace {
+	buf = make([]byte, 1024*1024)
+	//}
 	for {
 		_, src, err := ws.NextReader()
 		if err != nil {
