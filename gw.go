@@ -126,12 +126,6 @@ func wsPermissionViolation(message string, ws *websocket.Conn, trace bool) error
 	parts := strings.Split(message, " ")
 
 	cmd := parts[0]
-	switch cmd {
-	case "SUB ":
-		cmd = "Subscription"
-	case "PUB ":
-		cmd = "Publish"
-	}
 
 	subject := "?????"
 	if len(parts) > 1 {
