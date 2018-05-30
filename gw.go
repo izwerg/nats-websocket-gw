@@ -8,7 +8,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"strings"
 )
 
 type ErrorHandler func(error)
@@ -34,8 +33,8 @@ type Gateway struct {
 }
 
 var defaultUpgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
+	ReadBufferSize:  BUFFER_SIZE,
+	WriteBufferSize: BUFFER_SIZE,
 }
 
 type NatsConn struct {
@@ -75,106 +74,28 @@ func defaultErrorHandler(err error) {
 //	return int64(written), err
 //}
 
-// Check subject against -filter
-func checkSubject(message, filter string) bool {
-	parts := strings.Split(message, " ")
-	if len(parts) < 2 {
-		return true // no subject - skip
-	}
-	subject := parts[1]
-	farr := strings.Split(filter, ".")
-	sarr := strings.Split(subject, ".")
-
-	if len(sarr) < len(farr) {
-		return false
-	}
-
-	for i, f := range farr {
-		if sarr[i] != f && f != ">" && f != "*" {
-			return false
-		}
-	}
-	return true
-}
-
-// Filter messages to accepted and rejected
-func filterMessages(messages []string, settings Settings) (accepted []string, rejected []string) {
-	for _, message := range messages {
-		if message == "" {
-			continue
-		}
-
-		cmd := strings.ToUpper(substr(message, 0, 4))
-		if cmd != "SUB " && cmd != "PUB " { // allow commands other than PUB/SUB
-			accepted = append(accepted, message)
-			continue
-		}
-
-		allowed := checkSubject(message, settings.Filter)
-		if allowed { // allow allowed subjects
-			accepted = append(accepted, message)
-			continue
-		}
-
-		rejected = append(rejected, message)
-	}
-	return
-}
-
-// Send permission violation for message to WS
-func wsPermissionViolation(message string, ws *websocket.Conn, trace bool) error {
-	parts := strings.Split(message, " ")
-
-	cmd := parts[0]
-
-	subject := "?????"
-	if len(parts) > 1 {
-		subject = parts[1]
-	}
-
-	msg := fmt.Sprintf("-ERR 'Permissions Violation for %s to %s'\r\n", cmd, subject)
-	if trace {
-		fmt.Println("[TRACE]", "<--", msg)
-	}
-	if err := ws.WriteMessage(websocket.TextMessage, []byte(msg)); err != nil {
-		return err
-	}
-	return nil
-}
-
-// Copy from WebSocket to NATS with applying -filter
 func copyWsToNats(dst io.Writer, src io.Reader, buf []byte, ws *websocket.Conn, settings Settings) error {
-	read, err := src.Read(buf)
-	if err != nil {
-		return err
-	}
-	msgStr := string(buf[:read])
-	if settings.Trace {
-		fmt.Println("[TRACE]", "-->", msgStr)
-	}
 
-	if settings.Filter != "" { // subjects filtering enabled
-		accepted, rejected := filterMessages(strings.Split(msgStr, "\r\n"), settings)
+	var c client
+	c.dst = dst
+	c.ws = ws
+	c.filter = settings.Filter
+	c.trace = settings.Trace
 
-		for _, message := range rejected { // return error to WS for each rejected message
-			if err := wsPermissionViolation(message, ws, settings.Trace); err != nil {
-				return err
-			}
+	for {
+		read, readErr := src.Read(buf)
+		if readErr != nil && readErr != io.EOF {
+			return readErr
 		}
-
-		buf = []byte(strings.Join(accepted, "\r\n")) // update buf with merged accepted messages
-		if len(buf) == 0 {
-			return nil // nothing to send to NATS
+		if err := c.parse(buf[:read]); err != nil {
+			return err
 		}
-		buf = append(buf, 13, 10)
-		read = len(buf)
+		if readErr == io.EOF {
+			break
+		}
 	}
 
-	written, err := dst.Write(buf[:read])
-	if written != read {
-		return io.ErrShortWrite
-	}
-	return err
+	return nil
 }
 
 func NewGateway(settings Settings) *Gateway {
@@ -227,10 +148,8 @@ func (gw *Gateway) wsToNatsWorker(nats net.Conn, ws *websocket.Conn, doneCh chan
 	defer func() {
 		doneCh <- true
 	}()
-	var buf []byte
-	//if gw.settings.Trace {
-	buf = make([]byte, 1024*1024)
-	//}
+
+	buf := make([]byte, BUFFER_SIZE)
 	for {
 		_, src, err := ws.NextReader()
 		if err != nil {
@@ -239,16 +158,16 @@ func (gw *Gateway) wsToNatsWorker(nats net.Conn, ws *websocket.Conn, doneCh chan
 		}
 
 		err = copyWsToNats(nats, src, buf, ws, gw.settings)
+		if err != nil {
+			gw.onError(err)
+			return
+		}
 
 		//if gw.settings.Trace {
 		//	_, err = copyAndTrace("-->", nats, src, buf)
 		//} else {
 		//	_, err = io.Copy(nats, src)
 		//}
-		if err != nil {
-			gw.onError(err)
-			return
-		}
 	}
 }
 
@@ -331,13 +250,4 @@ func (gw *Gateway) initNatsConnectionForWSConn(wsConn *websocket.Conn) (*NatsCon
 	}
 
 	return &natsConn, nil
-}
-
-func substr(s string, pos, length int) string {
-	buf := []byte(s)
-	l := pos + length
-	if l > len(buf) {
-		l = len(buf)
-	}
-	return string(buf[pos:l])
 }
